@@ -1,0 +1,148 @@
+import pandas as pd
+import numpy as np
+
+# 1. val_data 불러오기 (예시: CSV 경로 직접 수정해서 사용)
+val_data = pd.read_csv('val_data.csv', parse_dates=['일시'])
+
+# 2. 강풍 특보 함수
+def wind_alarm(df):
+    wind_result = np.full(len(df), '해당없음', dtype=object)
+    wind = df['풍속(m/s)'].to_numpy()
+
+    # 풍속 21m/s 이상 -> 경보 (다음 시간 기준)
+    # 풍속 14m/s 이상 -> 주의보 (다음 시간 기준)
+    # 마지막 행은 판단불가 (데이터 부족)
+
+    wind_result[:-1] = np.where(wind[1:] >= 21, '경보',
+                         np.where(wind[1:] >= 14, '주의보', '해당없음'))
+    wind_result[-1] = '판단불가'
+    return wind_result
+
+# 3. 폭염 특보 함수
+def heat_alarm(df):
+    heat_result = np.full(len(df), '해당없음', dtype=object)
+    df['일자'] = df['일시'].dt.date
+
+    # 일 최고 온도 계산
+    daily_max = df.groupby('일자')['기온(°C)'].max()
+    dates = sorted(daily_max.index)
+
+    # 다음날, 다다음날 최고기온 조건 판단 (33°C 주의보, 35°C 경보)
+    heat_status = {}
+
+    for i in range(len(dates)-2):
+        d1 = daily_max[dates[i+1]]
+        d2 = daily_max[dates[i+2]]
+
+        if d1 >= 35 and d2 >= 35:
+            heat_status[dates[i]] = '경보'
+        elif d1 >= 33 and d2 >= 33:
+            heat_status[dates[i]] = '주의보'
+        else:
+            heat_status[dates[i]] = '해당없음'
+    # 마지막 2일은 판단불가
+    heat_status[dates[-1]] = '판단불가'
+    heat_status[dates[-2]] = '판단불가'
+
+    # 결과 날짜별로 할당
+    heat_result[:] = [heat_status.get(d, '판단불가') for d in df['일자']]
+    return heat_result
+
+# 4. 건조 특보 함수
+def dry_alarm(df):
+    dry_result = np.full(len(df), '해당없음', dtype=object)
+    df['일자'] = df['일시'].dt.date
+
+    # 일평균 상대습도 계산
+    daily_mean_humidity = df.groupby('일자')['습도(%)'].mean()
+
+    dates = sorted(daily_mean_humidity.index)
+    effective_humidity = {}
+
+    for i in range(len(dates)):
+        if i < 2 or i > len(dates) - 3:
+            # 처음 2일, 마지막 2일은 판단불가
+            effective_humidity[dates[i]] = np.nan
+        else:
+            val = (daily_mean_humidity[dates[i]] * 0.7 +
+                   daily_mean_humidity[dates[i-1]] * 0.2 +
+                   daily_mean_humidity[dates[i-2]] * 0.1)
+            effective_humidity[dates[i]] = val
+
+    dry_status = {}
+
+    for i in range(len(dates)-2):
+        eh1 = effective_humidity.get(dates[i+1], np.nan)
+        eh2 = effective_humidity.get(dates[i+2], np.nan)
+        if np.isnan(eh1) or np.isnan(eh2):
+            dry_status[dates[i]] = '판단불가'
+        elif eh1 <= 25 and eh2 <= 25:
+            dry_status[dates[i]] = '경보'
+        elif eh1 <= 35 and eh2 <= 35:
+            dry_status[dates[i]] = '주의보'
+        else:
+            dry_status[dates[i]] = '해당없음'
+
+    dry_status[dates[-1]] = '판단불가'
+    dry_status[dates[-2]] = '판단불가'
+
+    dry_result[:] = [dry_status.get(d, '판단불가') for d in df['일자']]
+    return dry_result
+
+# 5. 한파 특보 함수
+def cold_alarm(df):
+    cold_result = np.full(len(df), '해당없음', dtype=object)
+    df['일자'] = df['일시'].dt.date
+    df['월'] = df['일시'].dt.month
+
+    # 10월~4월 데이터만 판단, 아니면 해당없음 유지
+    valid_months = [10,11,12,1,2,3,4]
+    df_valid = df[df['월'].isin(valid_months)]
+
+    # 아침 최저기온 3~8시 기준
+    df_valid['시간'] = df_valid['일시'].dt.hour
+    morning_mask = (df_valid['시간'] >= 3) & (df_valid['시간'] <= 8)
+    morning_temp = df_valid[morning_mask].groupby('일자')['기온(°C)'].min()
+
+    dates = sorted(morning_temp.index)
+    cold_status = {}
+
+    for i in range(len(dates)-2):
+        today = dates[i]
+        next_day = dates[i+1]
+        day_after = dates[i+2]
+
+        # 조건1: 다음날 아침 최저기온이 금일 아침 최저기온보다 10도 이상 하강하여 3도 이하 (주의보)
+        cond1_warn = (morning_temp[next_day] <= morning_temp[today] - 10) and (morning_temp[next_day] <= 3)
+        # 조건1: 15도 이상 하강하여 3도 이하 (경보)
+        cond1_alert = (morning_temp[next_day] <= morning_temp[today] - 15) and (morning_temp[next_day] <= 3)
+
+        # 조건2: 다음날과 다다음날 아침 최저기온 -12도 이하 유지 (주의보)
+        cond2_warn = (morning_temp[next_day] <= -12) and (morning_temp[day_after] <= -12)
+        # 조건2: 다음날과 다다음날 아침 최저기온 -15도 이하 유지 (경보)
+        cond2_alert = (morning_temp[next_day] <= -15) and (morning_temp[day_after] <= -15)
+
+        if cond1_alert or cond2_alert:
+            cold_status[today] = '경보'
+        elif cond1_warn or cond2_warn:
+            cold_status[today] = '주의보'
+        else:
+            cold_status[today] = '해당없음'
+
+    cold_status[dates[-1]] = '판단불가'
+    cold_status[dates[-2]] = '판단불가'
+
+    cold_result[:] = [cold_status.get(d, '판단불가') for d in df['일자']]
+    # 10~4월 외에는 해당없음 유지
+    cold_result[~df['월'].isin(valid_months)] = '해당없음'
+
+    return cold_result
+
+# 6. 함수 적용 예시 및 결과 csv 저장
+val_data['강풍 특보'] = wind_alarm(val_data)
+val_data['폭염 특보'] = heat_alarm(val_data)
+val_data['건조 특보'] = dry_alarm(val_data)
+val_data['한파 특보'] = cold_alarm(val_data)
+
+# 제출용 csv로 저장
+val_data[['일시','강풍 특보','폭염 특보','건조 특보','한파 특보']].to_csv('12201738_박준하_제출결과.csv', index=False)
